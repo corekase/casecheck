@@ -1,0 +1,437 @@
+#!/usr/bin/env python3
+r"""
+casecheck - find names that will cause trouble when a tree moves to Windows.
+
+Four kinds of problems are reported:
+
+  1. Same directory: sibling entries whose names differ only by case, e.g.
+     "Readme.txt" and "README.TXT" (Windows is case-insensitive).
+  2. Merged directories: if "Foo/" and "foo/" both exist, Windows would merge
+     them into one folder, so same-named entries inside them also collide
+     (e.g. Foo/a.txt and foo/a.txt).
+  3. Invalid names: entries Windows cannot store under that name:
+       - reserved device names: CON, PRN, AUX, NUL, CONIN$, CONOUT$,
+         COM1-COM9, LPT1-LPT9 and the superscript-digit variants. These are
+         reserved in any letter case and with any extension, so "aux.c" and
+         "nul.tar.gz" are invalid too.
+       - illegal characters: < > : " \ | ? * and control characters (0-31)
+       - names ending in a dot or a space (Windows silently strips these,
+         so "report." would turn into "report")
+       - names longer than 255 characters
+  4. Paths too long: the full Windows path would reach MAX_PATH (260
+     characters including the terminating NUL), or, for folders, MAX_PATH - 12
+     (so an 8.3 filename can still be appended). Because the final location
+     matters, the path is measured as if the scanned directory lived at
+     --dest (default: C:\<name of the scanned directory>). Lengths are counted
+     in UTF-16 code units, the way Windows counts them.
+
+Logging is off by default. With --log, progress and a summary are printed to
+stderr, and every error is appended, with a timestamp, to the file given by
+--error-log (default: casecheck-errors.log in the current directory). Errors
+are both the problems this script exists to find (case conflicts, invalid
+names, paths too long) and anything that goes wrong while scanning (unreadable
+directories, startup failures, crashes). The file is only created if there is at
+least one error: a clean run with --log creates no file.
+
+Exit status: 0 = no problems, 1 = problems found, 2 = error / incomplete scan.
+
+Symlinks are never followed; they are treated as ordinary entries.
+"""
+
+import argparse
+import logging
+import os
+import sys
+from collections import defaultdict
+
+_DEVICE_NUMBERS = "123456789\u00b9\u00b2\u00b3"  # 1-9 plus superscript 1, 2, 3
+RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"}
+RESERVED_NAMES |= {f"{dev}{n}" for dev in ("COM", "LPT") for n in _DEVICE_NUMBERS}
+
+ILLEGAL_CHARS = set('<>:"\\|?*') | {chr(c) for c in range(32)}
+
+MAX_COMPONENT = 255  # longest single file/folder name on NTFS
+DEFAULT_MAX_PATH = 260  # Windows MAX_PATH, counting the terminating NUL
+DIR_PATH_MARGIN = 12  # folders must leave room for an 8.3 filename
+
+DEFAULT_ERROR_LOG = "casecheck-errors.log"
+LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
+
+# Logging is off unless --log is given: with only a NullHandler attached,
+# nothing is emitted, and nothing propagates to the root logger.
+log = logging.getLogger("casecheck")
+log.addHandler(logging.NullHandler())
+log.propagate = False
+
+
+class SafeFormatter(logging.Formatter):
+    """Keep log lines valid UTF-8 even if a filename has undecodable bytes."""
+
+    def format(self, record):
+        text = super().format(record)
+        return text.encode("utf-8", "backslashreplace").decode("utf-8")
+
+
+def check_error_log_path(path):
+    """Return a message if `path` can't be appended to, otherwise None."""
+    if os.path.isdir(path):
+        return f"error log is a directory: {path}"
+    if os.path.exists(path):
+        writable = os.access(path, os.W_OK)
+    else:
+        parent = os.path.dirname(os.path.abspath(path))
+        writable = os.path.isdir(parent) and os.access(parent, os.W_OK | os.X_OK)
+    return None if writable else f"cannot write to error log: {path}"
+
+
+def setup_logging(error_log):
+    """Turn logging on: progress to stderr, errors also appended to `error_log`."""
+    log.setLevel(logging.INFO)
+    formatter = SafeFormatter(LOG_FORMAT)
+
+    console = logging.StreamHandler(sys.stderr)
+    console.setLevel(logging.INFO)
+    # Errors are already printed as warnings; don't show them twice.
+    console.addFilter(lambda record: record.levelno < logging.ERROR)
+    console.setFormatter(formatter)
+    log.addHandler(console)
+
+    # delay=True: the file is only created when the first error is logged, so a
+    # run with no errors leaves no file behind.
+    to_file = logging.FileHandler(error_log, mode="a", encoding="utf-8", delay=True)
+    to_file.setLevel(logging.ERROR)
+    to_file.setFormatter(formatter)
+    log.addHandler(to_file)
+
+
+def fold(name):
+    """
+    Approximate how Windows (NTFS) compares names: a per-character, simple
+    uppercase mapping. Unlike str.casefold(), this does not treat e.g.
+    'ß' and 'ss' as equal, because Windows doesn't either.
+    """
+    out = []
+    for ch in name:
+        up = ch.upper()
+        out.append(up if len(up) == 1 else ch)
+    return "".join(out)
+
+
+def wlen(text):
+    """Length in UTF-16 code units, which is how Windows counts characters."""
+    return len(text.encode("utf-16-le", "surrogatepass")) // 2
+
+
+def printable(text):
+    """Escape control characters so odd filenames can't mangle the report."""
+    return "".join(
+        f"\\x{ord(c):02x}" if ord(c) < 32 or ord(c) == 127 else c for c in text
+    )
+
+
+def reserved_name(name):
+    """
+    Return the Windows device name that `name` maps to, or None.
+
+    Only the part before the first '.' counts (so "NUL.tar.gz" is reserved),
+    and trailing spaces before the extension are ignored ("NUL .txt").
+    """
+    stem = name.split(".", 1)[0].split(":", 1)[0].rstrip(" ")
+    key = fold(stem)
+    return key if key in RESERVED_NAMES else None
+
+
+def invalid_reasons(name):
+    """Return a list of human-readable reasons Windows can't use `name`."""
+    reasons = []
+
+    device = reserved_name(name)
+    if device:
+        reasons.append(f"reserved name {device}")
+
+    bad = sorted({c for c in name if c in ILLEGAL_CHARS})
+    if bad:
+        shown = " ".join(printable(c) for c in bad)
+        reasons.append(f"illegal character(s): {shown}")
+
+    if name.endswith("."):
+        reasons.append("trailing dot")
+    if name.endswith(" "):
+        reasons.append("trailing space")
+
+    length = wlen(name)
+    if length > MAX_COMPONENT:
+        reasons.append(f"name is {length} characters (limit {MAX_COMPONENT})")
+
+    return reasons
+
+
+def kind(path):
+    if os.path.islink(path):
+        return "link"
+    if os.path.isdir(path):
+        return "dir "
+    return "file"
+
+
+def scan(root, errors, dest, max_path):
+    """
+    Walk `root` and return (groups, invalid, too_long, stats).
+
+    groups:   {case-folded relative path (tuple): [real relative paths]}
+    invalid:  [(relative path, [reasons])] for names Windows can't use
+    too_long: [(relative path, windows length, limit)] for paths over the limit
+    stats:    {"dirs": directories scanned, "entries": files and folders seen}
+
+    Directories that can't be read are appended to `errors` (and logged).
+    `dest` is the Windows path (backslash separated, no trailing separator)
+    where the scanned directory is assumed to end up.
+    """
+    groups = defaultdict(list)
+    invalid = []
+    too_long = []
+    stats = {"dirs": 0, "entries": 0}
+
+    # Longest path, in characters, that fits once the terminating NUL is counted.
+    file_limit = max_path - 1
+    dir_limit = max_path - DIR_PATH_MARGIN - 1
+
+    def onerror(err):
+        errors.append(err)
+        log.error("could not read %s: %s", printable(str(err.filename)), err.strerror)
+
+    for dirpath, dirnames, filenames in os.walk(root, onerror=onerror):
+        stats["dirs"] += 1
+        rel = os.path.relpath(dirpath, root)
+        parts = [] if rel == "." else rel.split(os.sep)
+        parent_key = tuple(fold(p) for p in parts)
+        # Length of this directory's full Windows path.
+        dir_len = wlen(dest) + sum(1 + wlen(p) for p in parts)
+
+        for names, is_dir in ((dirnames, True), (filenames, False)):
+            for name in names:
+                stats["entries"] += 1
+                rel_path = os.path.join(*parts, name)
+                groups[parent_key + (fold(name),)].append(rel_path)
+
+                reasons = invalid_reasons(name)
+                if reasons:
+                    invalid.append((rel_path, reasons))
+
+                full_len = dir_len + 1 + wlen(name)
+                limit = dir_limit if is_dir else file_limit
+                if full_len > limit:
+                    too_long.append((rel_path, full_len, limit))
+
+    return groups, invalid, too_long, stats
+
+
+def show_conflicts(title, items, root):
+    print(f"\n{title}: {len(items)}")
+    for paths in items:
+        print()
+        for p in paths:
+            print(f"  [{kind(os.path.join(root, p))}] {printable(p)}")
+
+
+def show_invalid(items, root):
+    print(f"\nNames not valid on Windows: {len(items)}\n")
+    for path, reasons in sorted(items):
+        print(
+            f"  [{kind(os.path.join(root, path))}] '{printable(path)}'"
+            f"  ({'; '.join(reasons)})"
+        )
+
+
+def show_too_long(items, root, dest, max_path):
+    print(f"\nPaths too long for Windows: {len(items)}")
+    print(
+        f"(measured as if the tree lives at {dest}; longest allowed: "
+        f"{max_path - 1} characters for files, "
+        f"{max_path - DIR_PATH_MARGIN - 1} for folders)\n"
+    )
+    for path, length, limit in sorted(items, key=lambda i: (i[2] - i[1], i[0])):
+        print(
+            f"  [{kind(os.path.join(root, path))}] {length} chars, "
+            f"{length - limit} over  {printable(path)}"
+        )
+
+
+def quoted(path):
+    return "'" + printable(path) + "'"
+
+
+def log_findings(same_dir, merged, invalid, too_long):
+    """Write every problem found to the error log, one line each."""
+    for paths in same_dir:
+        log.error(
+            "case conflict in same directory: %s",
+            " | ".join(quoted(p) for p in paths),
+        )
+    for paths in merged:
+        log.error(
+            "case conflict inside directories that would merge: %s",
+            " | ".join(quoted(p) for p in paths),
+        )
+    for path, reasons in sorted(invalid):
+        log.error("name not valid on Windows: %s (%s)", quoted(path), "; ".join(reasons))
+    for path, length, limit in sorted(too_long, key=lambda i: (i[2] - i[1], i[0])):
+        log.error(
+            "path too long for Windows: %s (%d chars, %d over the limit of %d)",
+            quoted(path), length, length - limit, limit,
+        )
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Recursively find names that would be a problem on Windows: "
+        "files/folders differing only by case, reserved names, illegal "
+        "characters, trailing dots or spaces, and paths that are too long."
+    )
+    parser.add_argument("directory", help="directory to scan")
+    parser.add_argument(
+        "--siblings-only",
+        action="store_true",
+        help="for case conflicts, only report entries in the same directory "
+        "(skip conflicts that arise from merging case-colliding directories)",
+    )
+    parser.add_argument(
+        "--dest",
+        metavar="WINPATH",
+        help="Windows path where the scanned directory will end up, used to "
+        "measure path lengths, e.g. 'C:\\Users\\me\\projects\\mydir'. "
+        "Default: C:\\<name of the scanned directory>",
+    )
+    parser.add_argument(
+        "--max-path",
+        type=int,
+        default=DEFAULT_MAX_PATH,
+        metavar="N",
+        help="Windows MAX_PATH to check against, counting the terminating NUL "
+        f"(default {DEFAULT_MAX_PATH}). Folders are held to N - {DIR_PATH_MARGIN}. "
+        "Raise it if long-path support is enabled on the target machine.",
+    )
+    parser.add_argument(
+        "--log",
+        action="store_true",
+        help="enable logging (default: off). Progress and a summary go to "
+        "stderr; every problem found and every error is also appended to "
+        "the --error-log file.",
+    )
+    parser.add_argument(
+        "--error-log",
+        metavar="FILE",
+        help="text file that problems and errors are appended to when --log "
+        f"is on (default: {DEFAULT_ERROR_LOG} in the current directory). It is "
+        "only created if there is at least one error.",
+    )
+    args = parser.parse_args()
+
+    if args.max_path <= DIR_PATH_MARGIN + 1:
+        parser.error(f"--max-path must be greater than {DIR_PATH_MARGIN + 1}")
+    if args.error_log is not None and not args.log:
+        parser.error("--error-log requires --log")
+
+    # Don't crash on undecodable filenames when printing.
+    try:
+        sys.stdout.reconfigure(errors="backslashreplace")
+        sys.stderr.reconfigure(errors="backslashreplace")
+    except AttributeError:
+        pass
+
+    if args.log:
+        error_log = args.error_log or DEFAULT_ERROR_LOG
+        problem = check_error_log_path(error_log)
+        if problem:
+            parser.error(problem)
+        setup_logging(error_log)
+        log.info(
+            "error log (only created if there are errors): %s",
+            os.path.abspath(error_log),
+        )
+
+    root = args.directory
+    if not os.path.isdir(root):
+        message = f"not a directory: {printable(root)}"
+        log.error(message)
+        print(f"error: {message}", file=sys.stderr)
+        return 2
+
+    if args.dest is not None:
+        dest = args.dest.rstrip("\\/")
+    else:
+        dest = ("C:\\" + os.path.basename(os.path.abspath(root))).rstrip("\\/")
+
+    log.info("scanning %s", printable(root))
+    log.info("assuming Windows location %s with MAX_PATH %d", dest, args.max_path)
+
+    errors = []
+    groups, invalid, too_long, stats = scan(root, errors, dest, args.max_path)
+    log.info("scanned %d directories and %d entries", stats["dirs"], stats["entries"])
+
+    same_dir, merged = [], []
+    for paths in groups.values():
+        if len(paths) < 2:
+            continue
+        parents = {os.path.dirname(p) for p in paths}
+        (same_dir if len(parents) == 1 else merged).append(sorted(paths))
+    same_dir.sort()
+    merged.sort()
+    if args.siblings_only:
+        merged = []
+
+    log.info(
+        "found %d same-directory case conflicts, %d merged-directory case "
+        "conflicts, %d invalid names, %d paths too long",
+        len(same_dir), len(merged), len(invalid), len(too_long),
+    )
+    if args.log:
+        log_findings(same_dir, merged, invalid, too_long)
+
+    if same_dir:
+        show_conflicts("Same-directory case conflicts", same_dir, root)
+    if merged:
+        show_conflicts(
+            "Conflicts inside case-colliding directories (would merge on Windows)",
+            merged,
+            root,
+        )
+    if invalid:
+        show_invalid(invalid, root)
+    if too_long:
+        show_too_long(too_long, root, dest, args.max_path)
+
+    for err in errors:
+        print(
+            f"warning: could not read {printable(str(err.filename))}: {err.strerror}",
+            file=sys.stderr,
+        )
+
+    if same_dir or merged or invalid or too_long:
+        status = 1
+    elif errors:
+        print("No problems found, but some directories could not be scanned.", file=sys.stderr)
+        status = 2
+    else:
+        print(f"No problems found (path lengths measured as if the tree lives at {dest}).")
+        status = 0
+
+    problems = len(same_dir) + len(merged) + len(invalid) + len(too_long)
+    if problems or errors:
+        log.info("logged %d problem(s) found and %d read error(s)", problems, len(errors))
+    else:
+        log.info("no errors to log, so no error log file was created")
+    log.info("finished with exit status %d", status)
+    return status
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except BrokenPipeError:
+        # Output was piped to something like `head` that closed early.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(1)
+    except Exception:
+        log.exception("unexpected error")  # traceback goes to the error log
+        raise
