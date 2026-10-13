@@ -22,14 +22,14 @@ programs can parse it. The same lines can optionally be written to a log file.
 ## Quick start
 
 ```
-python3 casecheck.py /path/to/directory
+python3 casecheck /path/to/directory
 ```
 
 or, since the script has a shebang line:
 
 ```
-chmod +x casecheck.py
-./casecheck.py /path/to/directory
+chmod +x casecheck
+./casecheck /path/to/directory
 ```
 
 Fix whatever it reports and run it again until it exits with status 0 and shows
@@ -91,9 +91,9 @@ length and `limit` is the longest length allowed for that kind of entry.
 ## Usage
 
 ```
-casecheck.py [-h] [--siblings-only] [--dest WINPATH] [--max-path N]
-             [--log] [--error-log FILE]
-             directory
+casecheck [-h] [--siblings-only] [--dest WINPATH] [--max-path N]
+          [--log] [--error-log FILE]
+          directory
 ```
 
 | Argument | Description |
@@ -142,7 +142,7 @@ Columns are aligned here for reading; in the real output the fields are separate
 by single tabs.
 
 ```
-$ python3 casecheck.py /data/project
+$ python3 casecheck /data/project
 CASE    dir   Docs                     group=1
 CASE    file  docs                     group=1
 CASE    dir   Foo                      group=2
@@ -169,7 +169,7 @@ ERROR   dir   private                  Permission denied
 With `awk`:
 
 ```
-python3 casecheck.py /data/project | awk -F'\t' '$1 == "NAME" { print $3 }'
+python3 casecheck /data/project | awk -F'\t' '$1 == "NAME" { print $3 }'
 ```
 
 With Python:
@@ -178,7 +178,7 @@ With Python:
 import subprocess
 
 result = subprocess.run(
-    ["python3", "casecheck.py", "/data/project"],
+    ["python3", "casecheck", "/data/project"],
     capture_output=True, text=True, encoding="utf-8",
 )
 for line in result.stdout.split("\n"):
@@ -197,8 +197,8 @@ There are no timestamps or log levels in the file, which keeps it in the same
 parseable format.
 
 ```
-python3 casecheck.py /data/project --log
-python3 casecheck.py /data/project --log --error-log /var/tmp/scan.txt
+python3 casecheck /data/project --log
+python3 casecheck /data/project --log --error-log /var/tmp/scan.txt
 ```
 
 - **The file is only created if there is something to log.** If there is at least
@@ -235,7 +235,7 @@ stream was used.
 This makes it easy to use in scripts and CI:
 
 ```
-python3 casecheck.py build/ --log --error-log casecheck.txt || echo "Fix the names above"
+python3 casecheck build/ --log --error-log casecheck.txt || echo "Fix the names above"
 ```
 
 ## Function reference
